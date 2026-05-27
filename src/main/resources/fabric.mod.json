@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "llm_dog",
+  "version": "${version}",
+  "name": "LLM Dog",
+  "description": "Tamable dog driven by natural-language chat.",
+  "authors": ["Orcaengine"],
+  "contact": {
+    "homepage": "https://www.orcaengine.ai"
+  },
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["ai.orca.llmdog.LlmDogMod"],
+    "client": ["ai.orca.llmdog.client.LlmDogClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

@@ -1,0 +1,9 @@
+build/
+.gradle/
+*.class
+.idea/
+*.iml
+run/
+# bundled models: ship in releases, not git
+src/main/resources/assets/llm_dog/ai/*.gguf
+src/main/resources/assets/llm_dog/ai/*.bin

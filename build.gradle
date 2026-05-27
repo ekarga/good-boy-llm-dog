@@ -1,0 +1,87 @@
+plugins {
+	id 'fabric-loom' version '1.7-SNAPSHOT'
+	id 'com.gradleup.shadow' version '8.3.5'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"llm_dog" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+repositories {
+	maven { url 'https://maven.fabricmc.net/' }
+	mavenCentral()
+}
+
+configurations {
+	bundleLibs
+	implementation.extendsFrom bundleLibs
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+	// Ship Fabric API inside our jar so the user drops a single file.
+	include "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+	// In-process inference -- llama.cpp + whisper.cpp JNI wrappers that
+	// bundle macOS arm64 + x86_64, Linux, Windows native libs in their jars.
+	bundleLibs 'de.kherud:llama:4.1.0'
+	bundleLibs 'io.github.givimad:whisper-jni:1.7.1'
+}
+
+processResources {
+	inputs.property "version", project.version
+	filesMatching("fabric.mod.json") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 21
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_21
+	targetCompatibility = JavaVersion.VERSION_21
+}
+
+// Shade llama-jni + whisper-jni (plain Java libs) into the main jar so they
+// load on Minecraft's classloader without nesting. Pull in BOTH main and
+// client source sets since loom splits envs.
+shadowJar {
+	configurations = [project.configurations.bundleLibs]
+	from(sourceSets.main.output)
+	from(sourceSets.client.output)
+	archiveClassifier = 'shadow'
+	mergeServiceFiles()
+	exclude 'META-INF/*.SF'
+	exclude 'META-INF/*.DSA'
+	exclude 'META-INF/*.RSA'
+	exclude 'module-info.class'
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+shadowJar.dependsOn classes
+shadowJar.dependsOn(project.tasks.named('clientClasses'))
+
+// Run shadow first; then loom's remapJar consumes the shaded output.
+remapJar {
+	dependsOn shadowJar
+	inputFile = shadowJar.archiveFile
+}
