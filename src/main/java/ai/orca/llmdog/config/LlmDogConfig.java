@@ -39,10 +39,19 @@ public class LlmDogConfig {
     public boolean alwaysListen = true;
     public int vadStartRms = 600;        // RMS that triggers "speech started" (lower = more sensitive)
     public int vadKeepRms = 300;         // RMS below this counts as silence
-    public int vadSilenceMs = 700;       // trailing silence that ends an utterance
+    public int vadSilenceMs = 500;       // trailing silence that ends an utterance
     public int vadMinUtteranceMs = 250;  // ignore blips shorter than this
     public int vadMaxUtteranceMs = 12000;// hard cap so one utterance can't run forever
     public int vadPrerollMs = 400;       // audio kept just before the trigger (avoids clipped first word)
+
+    // Streaming early-fire: while an utterance is still being spoken, partial
+    // snapshots of the audio are transcribed and resolved; when two consecutive
+    // partials agree on the same non-empty command list, the dog acts
+    // immediately instead of waiting for end-of-speech. The final transcript
+    // reconciles afterwards (fires only what the stream didn't already fire).
+    public boolean streamPartials = true;
+    public int streamPartialStrideMs = 300; // new audio required between partial decodes
+    public int streamMinPartialMs = 350;    // don't decode partials shorter than this
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 

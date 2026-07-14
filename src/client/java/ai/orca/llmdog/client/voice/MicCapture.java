@@ -103,6 +103,18 @@ public class MicCapture {
      * as raw 16-bit LE mono PCM. Call {@link #stopContinuous()} to tear down.
      */
     public synchronized boolean startContinuous(Consumer<byte[]> onUtterance) {
+        return startContinuous(onUtterance, null);
+    }
+
+    /**
+     * Always-on capture with streaming: while an utterance is still in
+     * progress, {@code onPartial} (nullable) receives growing snapshots of the
+     * utterance-so-far every ~{@code streamPartialStrideMs} of new audio, so
+     * the command pipeline can react before the speaker stops talking. The
+     * callback runs on the VAD thread — it MUST hand off immediately and never
+     * block, or the mic line will overrun.
+     */
+    public synchronized boolean startContinuous(Consumer<byte[]> onUtterance, Consumer<byte[]> onPartial) {
         if (recording.get()) return false;
         try {
             AudioFormat format = new AudioFormat(sampleRate, 16, 1, true, false);
@@ -115,7 +127,7 @@ public class MicCapture {
             line.open(format);
             line.start();
             recording.set(true);
-            captureThread = new Thread(() -> vadLoop(onUtterance), "llm-dog-mic-vad");
+            captureThread = new Thread(() -> vadLoop(onUtterance, onPartial), "llm-dog-mic-vad");
             captureThread.setDaemon(true);
             captureThread.start();
             LlmDogMod.LOGGER.info("[Voice] always-on VAD capture started (startRms={}, silence={}ms)",
@@ -137,12 +149,15 @@ public class MicCapture {
         }
     }
 
-    private void vadLoop(Consumer<byte[]> onUtterance) {
+    private void vadLoop(Consumer<byte[]> onUtterance, Consumer<byte[]> onPartial) {
         final int bytesPerSec = sampleRate * 2; // 16-bit mono
         final long silenceLimit = (long) config.vadSilenceMs * bytesPerSec / 1000;
         final long maxUtterBytes = (long) config.vadMaxUtteranceMs * bytesPerSec / 1000;
         final long minUtterBytes = (long) config.vadMinUtteranceMs * bytesPerSec / 1000;
         final int prerollBytes = Math.max(0, config.vadPrerollMs * bytesPerSec / 1000);
+        final boolean streaming = onPartial != null && config.streamPartials;
+        final long partialStrideBytes = Math.max(1, (long) config.streamPartialStrideMs * bytesPerSec / 1000);
+        final long minPartialBytes = (long) config.streamMinPartialMs * bytesPerSec / 1000;
 
         byte[] chunk = new byte[2048]; // ~64ms at 16kHz/16-bit
         ArrayDeque<byte[]> preroll = new ArrayDeque<>();
@@ -150,6 +165,7 @@ public class MicCapture {
         ByteArrayOutputStream utter = null;
         boolean speaking = false;
         long silenceBytes = 0;
+        long lastPartialMark = 0;
         // Level meter: peak RMS per window, logged so a dead mic (permission
         // denied -> all zeros) is visible instead of silently hearing nothing.
         double peakRms = 0;
@@ -178,6 +194,7 @@ public class MicCapture {
                 if (rms >= config.vadStartRms) {
                     speaking = true;
                     silenceBytes = 0;
+                    lastPartialMark = 0;
                     utter = new ByteArrayOutputStream(64 * 1024);
                     for (byte[] p : preroll) utter.write(p, 0, p.length);
                     preroll.clear();
@@ -188,6 +205,15 @@ public class MicCapture {
                 utter.write(chunk, 0, n);
                 if (rms < config.vadKeepRms) silenceBytes += n;
                 else silenceBytes = 0;
+
+                // Streaming: hand growing snapshots to the partial pipeline so
+                // commands can fire mid-sentence. Handler must not block.
+                if (streaming && utter.size() >= minPartialBytes
+                        && utter.size() - lastPartialMark >= partialStrideBytes) {
+                    lastPartialMark = utter.size();
+                    try { onPartial.accept(utter.toByteArray()); }
+                    catch (Exception e) { LlmDogMod.LOGGER.warn("[Voice] partial handler error: {}", e.getMessage()); }
+                }
 
                 boolean ended = silenceBytes >= silenceLimit;
                 boolean tooLong = utter.size() >= maxUtterBytes;

@@ -37,6 +37,16 @@ public class LocalWhisper {
      * @return transcript or null on failure
      */
     public static CompletableFuture<String> transcribeAsync(byte[] pcm16le) {
+        return transcribeAsync(pcm16le, false);
+    }
+
+    /**
+     * @param fast greedy single-pass decode for streaming partials — roughly
+     *             half the latency of the beam search used on final utterances.
+     *             The stream's two-partials-must-agree rule absorbs the
+     *             accuracy loss.
+     */
+    public static CompletableFuture<String> transcribeAsync(byte[] pcm16le, boolean fast) {
         return CompletableFuture.supplyAsync(() -> {
             if (!attemptedInit) init();
             if (jni == null || ctx == null) return null;
@@ -48,7 +58,7 @@ public class LocalWhisper {
                     short s = (short) ((hi << 8) | lo);
                     samples[i] = s / 32768.0f;
                 }
-                WhisperFullParams params = buildParams();
+                WhisperFullParams params = buildParams(fast);
                 int result;
                 synchronized (LocalWhisper.class) {
                     result = jni.full(ctx, params, samples, samples.length);
@@ -76,11 +86,12 @@ public class LocalWhisper {
      * dog-command words so "sit"/"come"/"attack" are far less likely to be
      * mis-transcribed (and then silently dropped by the command gate).
      */
-    private static WhisperFullParams buildParams() {
-        WhisperFullParams p = new WhisperFullParams(WhisperSamplingStrategy.BEAN_SEARCH);
+    private static WhisperFullParams buildParams(boolean fast) {
+        WhisperFullParams p = new WhisperFullParams(
+            fast ? WhisperSamplingStrategy.GREEDY : WhisperSamplingStrategy.BEAN_SEARCH);
         p.nThreads = Math.max(2, Runtime.getRuntime().availableProcessors() - 1);
-        p.beamSearchBeamSize = 5;
-        p.greedyBestOf = 5;
+        p.beamSearchBeamSize = fast ? 1 : 5;
+        p.greedyBestOf = fast ? 1 : 5;
         p.language = "en";
         p.detectLanguage = false;
         p.translate = false;
