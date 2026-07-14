@@ -9,11 +9,18 @@ import javax.sound.sampled.DataLine;
 import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.TargetDataLine;
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
- * Push-to-talk mic capture. Reads 16kHz mono PCM into a buffer while
- * recording, returns a WAV-wrapped byte array when stopped.
+ * Mic capture with two modes:
+ *  - Push-to-talk: {@link #start()} / {@link #stopAndGetPcm()} bracket a recording.
+ *  - Always-on: {@link #startContinuous(Consumer)} keeps the line open and runs an
+ *    energy-based voice-activity detector, handing each detected utterance (raw
+ *    16-bit LE mono PCM) to the callback.
+ * Reads 16kHz mono PCM.
  */
 public class MicCapture {
     private final AtomicBoolean recording = new AtomicBoolean(false);
@@ -21,8 +28,10 @@ public class MicCapture {
     private ByteArrayOutputStream buffer;
     private TargetDataLine line;
     private final int sampleRate;
+    private final LlmDogConfig config;
 
     public MicCapture(LlmDogConfig config) {
+        this.config = config;
         this.sampleRate = config.micSampleRateHz;
     }
 
@@ -86,6 +95,127 @@ public class MicCapture {
             return null;
         }
         return pcm;
+    }
+
+    /**
+     * Always-on capture. Opens the line once and runs an energy-based VAD on a
+     * daemon thread; each detected utterance is delivered to {@code onUtterance}
+     * as raw 16-bit LE mono PCM. Call {@link #stopContinuous()} to tear down.
+     */
+    public synchronized boolean startContinuous(Consumer<byte[]> onUtterance) {
+        if (recording.get()) return false;
+        try {
+            AudioFormat format = new AudioFormat(sampleRate, 16, 1, true, false);
+            DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
+            if (!AudioSystem.isLineSupported(info)) {
+                LlmDogMod.LOGGER.warn("[Voice] microphone line not supported at {} Hz mono 16-bit", sampleRate);
+                return false;
+            }
+            line = (TargetDataLine) AudioSystem.getLine(info);
+            line.open(format);
+            line.start();
+            recording.set(true);
+            captureThread = new Thread(() -> vadLoop(onUtterance), "llm-dog-mic-vad");
+            captureThread.setDaemon(true);
+            captureThread.start();
+            LlmDogMod.LOGGER.info("[Voice] always-on VAD capture started (startRms={}, silence={}ms)",
+                config.vadStartRms, config.vadSilenceMs);
+            return true;
+        } catch (LineUnavailableException e) {
+            LlmDogMod.LOGGER.warn("[Voice] mic line unavailable: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    public synchronized void stopContinuous() {
+        if (!recording.get()) return;
+        recording.set(false);
+        try { if (captureThread != null) captureThread.join(800); }
+        catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        if (line != null) {
+            try { line.stop(); line.drain(); line.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void vadLoop(Consumer<byte[]> onUtterance) {
+        final int bytesPerSec = sampleRate * 2; // 16-bit mono
+        final long silenceLimit = (long) config.vadSilenceMs * bytesPerSec / 1000;
+        final long maxUtterBytes = (long) config.vadMaxUtteranceMs * bytesPerSec / 1000;
+        final long minUtterBytes = (long) config.vadMinUtteranceMs * bytesPerSec / 1000;
+        final int prerollBytes = Math.max(0, config.vadPrerollMs * bytesPerSec / 1000);
+
+        byte[] chunk = new byte[2048]; // ~64ms at 16kHz/16-bit
+        ArrayDeque<byte[]> preroll = new ArrayDeque<>();
+        int prerollSize = 0;
+        ByteArrayOutputStream utter = null;
+        boolean speaking = false;
+        long silenceBytes = 0;
+        // Level meter: peak RMS per window, logged so a dead mic (permission
+        // denied -> all zeros) is visible instead of silently hearing nothing.
+        double peakRms = 0;
+        long lastLevelLog = System.currentTimeMillis();
+
+        while (recording.get()) {
+            int n = line.read(chunk, 0, chunk.length);
+            if (n <= 0) continue;
+            double rms = rms(chunk, n);
+            if (rms > peakRms) peakRms = rms;
+            long now = System.currentTimeMillis();
+            if (now - lastLevelLog >= 15000) {
+                LlmDogMod.LOGGER.info("[Voice] mic level: peak RMS {} over last 15s (trigger threshold {}{})",
+                    (int) peakRms, config.vadStartRms, peakRms < 10 ? " — mic looks DEAD/muted" : "");
+                peakRms = 0;
+                lastLevelLog = now;
+            }
+
+            if (!speaking) {
+                // keep a short rolling pre-roll so the first syllable isn't clipped
+                preroll.addLast(Arrays.copyOf(chunk, n));
+                prerollSize += n;
+                while (prerollSize > prerollBytes && !preroll.isEmpty()) {
+                    prerollSize -= preroll.removeFirst().length;
+                }
+                if (rms >= config.vadStartRms) {
+                    speaking = true;
+                    silenceBytes = 0;
+                    utter = new ByteArrayOutputStream(64 * 1024);
+                    for (byte[] p : preroll) utter.write(p, 0, p.length);
+                    preroll.clear();
+                    prerollSize = 0;
+                    utter.write(chunk, 0, n);
+                }
+            } else {
+                utter.write(chunk, 0, n);
+                if (rms < config.vadKeepRms) silenceBytes += n;
+                else silenceBytes = 0;
+
+                boolean ended = silenceBytes >= silenceLimit;
+                boolean tooLong = utter.size() >= maxUtterBytes;
+                if (ended || tooLong) {
+                    byte[] pcm = utter.toByteArray();
+                    speaking = false;
+                    utter = null;
+                    silenceBytes = 0;
+                    if (pcm.length >= minUtterBytes) {
+                        LlmDogMod.LOGGER.info("[Voice] utterance captured ({} ms)", pcm.length * 1000L / bytesPerSec);
+                        try { onUtterance.accept(pcm); }
+                        catch (Exception e) { LlmDogMod.LOGGER.warn("[Voice] utterance handler error: {}", e.getMessage()); }
+                    }
+                }
+            }
+        }
+    }
+
+    /** RMS amplitude of a 16-bit LE mono PCM chunk (first {@code n} bytes). */
+    private static double rms(byte[] b, int n) {
+        int samples = n / 2;
+        if (samples == 0) return 0;
+        long sum = 0;
+        for (int i = 0; i + 1 < n; i += 2) {
+            int s = (short) ((b[i] & 0xff) | (b[i + 1] << 8));
+            sum += (long) s * s;
+        }
+        return Math.sqrt((double) sum / samples);
     }
 
     /** Wrap raw 16-bit PCM mono into a minimal RIFF/WAV. */

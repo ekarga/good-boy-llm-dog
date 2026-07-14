@@ -12,17 +12,37 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 public class LlmDogConfig {
-    // Default to local Ollama (OpenAI-compatible). Works out of the box if Ollama is running.
-    public String proxyUrl = "http://localhost:11434/v1";
-    public String proxyKey = "ollama";
-    public String model = "llama3.2:3b";
     public int listenRadius = 32;
-    public boolean enableLlm = true;
+
+    // Natural-language understanding -- Mercury dLLM (Inception Labs),
+    // OpenAI-compatible API. Only consulted when the local keyword parser
+    // finds no command, so exact phrases stay instant and offline. Key comes
+    // from llmApiKey here or the MERCURY_API_KEY environment variable; with
+    // neither set the feature is silently off.
+    public boolean llmEnabled = true;
+    public String llmBaseUrl = "https://api.inceptionlabs.ai/v1";
+    public String llmModel = "mercury-2";
+    public String llmApiKey = "";
+    public int llmTimeoutMs = 6000;
+    // Utterances longer than this many words skip the model (ambient speech
+    // picked up by the always-on mic shouldn't burn credits).
+    public int llmMaxWords = 24;
 
     // Speech to text -- local whisper.cpp server (`whisper-server`). Open source.
     public boolean sttEnabled = true;
     public String sttUrl = "http://localhost:8732/inference";
     public int micSampleRateHz = 16000;
+
+    // Always-on listening: when true the mic stays open and a voice-activity
+    // detector (VAD) auto-segments each utterance instead of holding the
+    // push-to-talk key. Set false to fall back to hold-V push-to-talk.
+    public boolean alwaysListen = true;
+    public int vadStartRms = 600;        // RMS that triggers "speech started" (lower = more sensitive)
+    public int vadKeepRms = 300;         // RMS below this counts as silence
+    public int vadSilenceMs = 700;       // trailing silence that ends an utterance
+    public int vadMinUtteranceMs = 250;  // ignore blips shorter than this
+    public int vadMaxUtteranceMs = 12000;// hard cap so one utterance can't run forever
+    public int vadPrerollMs = 400;       // audio kept just before the trigger (avoids clipped first word)
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 

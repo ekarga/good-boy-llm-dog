@@ -5,6 +5,7 @@ import ai.orca.llmdog.ai.Bootstrap;
 import io.github.givimad.whisperjni.WhisperContext;
 import io.github.givimad.whisperjni.WhisperFullParams;
 import io.github.givimad.whisperjni.WhisperJNI;
+import io.github.givimad.whisperjni.WhisperSamplingStrategy;
 
 import java.util.concurrent.CompletableFuture;
 
@@ -47,7 +48,7 @@ public class LocalWhisper {
                     short s = (short) ((hi << 8) | lo);
                     samples[i] = s / 32768.0f;
                 }
-                WhisperFullParams params = new WhisperFullParams();
+                WhisperFullParams params = buildParams();
                 int result;
                 synchronized (LocalWhisper.class) {
                     result = jni.full(ctx, params, samples, samples.length);
@@ -61,11 +62,53 @@ public class LocalWhisper {
                 for (int i = 0; i < n; i++) {
                     sb.append(jni.fullGetSegmentText(ctx, i));
                 }
-                return sb.toString().trim();
+                return cleanup(sb.toString());
             } catch (Throwable t) {
                 LlmDogMod.LOGGER.warn("[Good Boy] whisper infer failed: {}", t.getMessage());
                 return null;
             }
         });
+    }
+
+    /**
+     * Tuned params for a SMALL fixed command vocabulary spoken in short bursts.
+     * The biggest lever is {@code initialPrompt}: it primes whisper toward the
+     * dog-command words so "sit"/"come"/"attack" are far less likely to be
+     * mis-transcribed (and then silently dropped by the command gate).
+     */
+    private static WhisperFullParams buildParams() {
+        WhisperFullParams p = new WhisperFullParams(WhisperSamplingStrategy.BEAN_SEARCH);
+        p.nThreads = Math.max(2, Runtime.getRuntime().availableProcessors() - 1);
+        p.beamSearchBeamSize = 5;
+        p.greedyBestOf = 5;
+        p.language = "en";
+        p.detectLanguage = false;
+        p.translate = false;
+        p.noContext = true;       // each utterance is independent
+        p.singleSegment = true;   // commands are one short segment
+        p.suppressBlank = true;
+        p.suppressNonSpeechTokens = true;
+        p.noTimestamps = true;
+        p.printProgress = false;
+        p.printRealtime = false;
+        p.printTimestamps = false;
+        p.printSpecial = false;
+        p.temperature = 0.0f;
+        p.initialPrompt =
+            "Dog obedience commands: sit, stay, stand, get up, come, here, heel, follow, "
+          + "attack, kill, fetch, spin, twirl, jump, hop, good boy, good dog, fetch diamonds.";
+        return p;
+    }
+
+    /** Strip whisper non-speech artifacts like [BLANK_AUDIO], (wind), *music*. */
+    private static String cleanup(String raw) {
+        if (raw == null) return null;
+        String out = raw
+            .replaceAll("\\[[^\\]]*\\]", " ")
+            .replaceAll("\\([^\\)]*\\)", " ")
+            .replaceAll("\\*[^\\*]*\\*", " ")
+            .replaceAll("\\s+", " ")
+            .trim();
+        return out;
     }
 }

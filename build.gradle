@@ -19,6 +19,17 @@ loom {
 			sourceSet sourceSets.client
 		}
 	}
+
+	// Dev test launch: boot straight into the fresh flat creative test world
+	// instead of the title screen. (Remove for release builds.)
+	runs {
+		client {
+			programArgs("--quickPlaySingleplayer", "GoodBoyTest")
+			// Stable dev identity so tamed wolves stay yours across restarts
+			// (default dev usernames rotate: Player10, Player513, ...).
+			programArgs("--username", "Ege")
+		}
+	}
 }
 
 repositories {
@@ -40,9 +51,9 @@ dependencies {
 	// Ship Fabric API inside our jar so the user drops a single file.
 	include "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-	// In-process inference -- llama.cpp + whisper.cpp JNI wrappers that
-	// bundle macOS arm64 + x86_64, Linux, Windows native libs in their jars.
-	bundleLibs 'de.kherud:llama:4.1.0'
+	// In-process speech-to-text -- whisper.cpp JNI wrapper that bundles
+	// macOS arm64 + x86_64, Linux, Windows native libs. Intent understanding
+	// is a local keyword/fuzzy parser (no LLM), so no llama.cpp dependency.
 	bundleLibs 'io.github.givimad:whisper-jni:1.7.1'
 }
 
@@ -66,9 +77,10 @@ java {
 // load on Minecraft's classloader without nesting. Pull in BOTH main and
 // client source sets since loom splits envs.
 shadowJar {
-	configurations = [project.configurations.bundleLibs]
+	// Shade our own classes alongside the whisper-jni dep.
 	from(sourceSets.main.output)
 	from(sourceSets.client.output)
+	configurations = [project.configurations.bundleLibs]
 	archiveClassifier = 'shadow'
 	mergeServiceFiles()
 	exclude 'META-INF/*.SF'

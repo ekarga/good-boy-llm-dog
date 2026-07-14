@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "ai.orca.llmdog.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "WolfEntityModelMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

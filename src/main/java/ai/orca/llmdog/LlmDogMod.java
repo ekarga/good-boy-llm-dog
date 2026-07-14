@@ -1,15 +1,18 @@
 package ai.orca.llmdog;
 
 import ai.orca.llmdog.ai.Bootstrap;
-import ai.orca.llmdog.ai.LocalLlm;
 import ai.orca.llmdog.config.LlmDogConfig;
-import ai.orca.llmdog.entity.LlmDogEntity;
+import ai.orca.llmdog.entity.WolfCommander;
 import ai.orca.llmdog.llm.IntentParser;
-import ai.orca.llmdog.registry.ModEntities;
-import ai.orca.llmdog.registry.ModItems;
+import ai.orca.llmdog.llm.MercuryIntentClient;
+import ai.orca.llmdog.net.DogCommandPayload;
+import ai.orca.llmdog.net.DogPosePayload;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
-import net.fabricmc.fabric.api.object.builder.v1.entity.FabricDefaultAttributeRegistry;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.entity.passive.WolfEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -17,7 +20,9 @@ import net.minecraft.util.math.Box;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 public class LlmDogMod implements ModInitializer {
     public static final String MOD_ID = "llm_dog";
@@ -29,20 +34,33 @@ public class LlmDogMod implements ModInitializer {
     public void onInitialize() {
         config = LlmDogConfig.load();
         Bootstrap.ensureExtracted();
-        // Init the in-process LLM off-thread so server boot isn't blocked
-        new Thread(LocalLlm::init, "good-boy-llm-init").start();
 
-        ModEntities.register();
-        ModItems.register();
+        // S2C pose packet (paw / down / shake) — registered on both sides here.
+        PayloadTypeRegistry.playS2C().register(DogPosePayload.ID, DogPosePayload.CODEC);
 
-        FabricDefaultAttributeRegistry.register(ModEntities.LLM_DOG, LlmDogEntity.createDogAttributes());
+        // C2S resolved-command packet from the voice path (handler runs on the
+        // server thread). Intents are re-validated by the WolfCommander switch,
+        // which ignores anything it doesn't know.
+        PayloadTypeRegistry.playC2S().register(DogCommandPayload.ID, DogCommandPayload.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(DogCommandPayload.ID, (payload, context) -> {
+            List<String> intents = new ArrayList<>();
+            for (String s : payload.intentsCsv().split(",")) {
+                if (!s.isBlank()) intents.add(s.trim());
+                if (intents.size() >= 6) break;
+            }
+            if (!intents.isEmpty()) commandWolves(context.player(), intents);
+        });
 
         ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
             String text = message.getContent().getString();
             handleChat(sender, text);
         });
 
-        LOGGER.info("[LLM Dog] initialized. llm enabled={} model={}", config.enableLlm, config.model);
+        // Advances time-based wolf commands (spin, come) each tick.
+        ServerTickEvents.END_SERVER_TICK.register(WolfCommander::tick);
+
+        LOGGER.info("[Good Boy] initialized. Trained vanilla wolves obey (local parser + Mercury dLLM fallback{}).",
+            MercuryIntentClient.enabled() ? "" : " — NO API KEY, model OFF");
     }
 
     private static void handleChat(ServerPlayerEntity sender, String rawText) {
@@ -53,57 +71,42 @@ public class LlmDogMod implements ModInitializer {
         boolean hasPrefix = text.toLowerCase().startsWith("dog:");
         String payload = hasPrefix ? text.substring(4).trim() : text;
 
-        ServerWorld world = sender.getServerWorld();
-        LlmDogEntity dog = findOwnedDog(world, sender, config.listenRadius);
-        if (dog == null) {
-            int total = world.getEntitiesByClass(LlmDogEntity.class, sender.getBoundingBox().expand(config.listenRadius), d -> true).size();
-            int tamed = world.getEntitiesByClass(LlmDogEntity.class, sender.getBoundingBox().expand(config.listenRadius), d -> d.isTamed()).size();
-            int owned = world.getEntitiesByClass(LlmDogEntity.class, sender.getBoundingBox().expand(config.listenRadius), d -> d.isTamed() && d.isOwner(sender)).size();
-            LOGGER.info("[LLM Dog] chat from {} but no owned dog nearby (within {} blocks: total={}, tamed={}, owned-by-you={}): \"{}\"",
-                sender.getName().getString(), config.listenRadius, total, tamed, owned, text);
-            return;
-        }
-        if (!hasPrefix && dog.squaredDistanceTo(sender) > (double) config.listenRadius * config.listenRadius) return;
-        LOGGER.info("[LLM Dog] chat -> dog: from={} prefix={} text={}", sender.getName().getString(), hasPrefix, payload);
-
-        if (!config.enableLlm) {
-            String intent = IntentParser.keywordFallback(payload);
-            if (intent != null) dog.executeIntent(intent);
-            else dog.whineNoOp();
-            return;
-        }
-
-        LocalLlm.getIntentAsync(payload).thenAccept(intent -> {
-            // Fall back to keyword match if LLM didn't produce a usable intent
-            String finalIntent = intent != null ? intent : IntentParser.keywordFallback(payload);
-            world.getServer().execute(() -> {
-                if (finalIntent == null) dog.whineNoOp();
-                else dog.executeIntent(finalIntent);
+        // Short utterances resolve instantly offline; sentences go through
+        // Mercury, which understands negation ("you don't want to attack").
+        // No command either way -> silent no-op.
+        MercuryIntentClient.resolve(payload).thenAccept(intents -> {
+            if (intents.isEmpty()) return;
+            // Hop back onto the server thread before touching the world.
+            sender.getServer().execute(() -> {
+                if (!sender.isRemoved()) commandWolves(sender, intents);
             });
-        }).exceptionally(t -> {
-            LOGGER.warn("[Good Boy] LLM call failed: {}", t.getMessage());
-            String kw = IntentParser.keywordFallback(payload);
-            world.getServer().execute(() -> {
-                if (kw == null) dog.whineNoOp();
-                else dog.executeIntent(kw);
-            });
-            return null;
         });
     }
 
-    private static LlmDogEntity findOwnedDog(ServerWorld world, PlayerEntity owner, int radius) {
+    /** Run an intent sequence on ALL trained (tamed + owned) wolves in range — the whole pack. */
+    private static void commandWolves(ServerPlayerEntity sender, List<String> intents) {
+        ServerWorld world = sender.getServerWorld();
+        List<WolfEntity> wolves = findOwnedWolves(world, sender, config.listenRadius);
+        if (wolves.isEmpty()) {
+            int total = world.getEntitiesByClass(WolfEntity.class, sender.getBoundingBox().expand(config.listenRadius), d -> true).size();
+            LOGGER.info("[Good Boy] command from {} but no trained wolf nearby (within {} blocks; wolves seen={}): {}",
+                sender.getName().getString(), config.listenRadius, total, intents);
+            return;
+        }
+
+        List<UUID> ids = new ArrayList<>(wolves.size());
+        for (WolfEntity w : wolves) ids.add(w.getUuid());
+        LOGGER.info("[Good Boy] {} trained wolf(s) <- {}", ids.size(), intents);
+        WolfCommander.runSequence(world.getServer(), sender.getUuid(), ids, intents);
+    }
+
+    /** ALL vanilla wolves the player has tamed (= trained) and owns, within radius. */
+    private static List<WolfEntity> findOwnedWolves(ServerWorld world, PlayerEntity owner, int radius) {
         double r = radius;
         Box box = new Box(
             owner.getX() - r, owner.getY() - r, owner.getZ() - r,
             owner.getX() + r, owner.getY() + r, owner.getZ() + r
         );
-        List<LlmDogEntity> dogs = world.getEntitiesByClass(LlmDogEntity.class, box, d -> d.isTamed() && d.isOwner(owner));
-        LlmDogEntity closest = null;
-        double bestDist = Double.MAX_VALUE;
-        for (LlmDogEntity d : dogs) {
-            double dist = d.squaredDistanceTo(owner);
-            if (dist < bestDist) { bestDist = dist; closest = d; }
-        }
-        return closest;
+        return world.getEntitiesByClass(WolfEntity.class, box, d -> d.isTamed() && d.isOwner(owner));
     }
 }
